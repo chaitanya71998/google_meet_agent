@@ -1,0 +1,22 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+
+# Local secrets / session data
+.google_meet_agent/
+*.pem
+*.key
+credentials.json
+token.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.log
+npm-debug.log*
+
+# Puppeteer / Chrome leftovers in-project
+chrome-profile/

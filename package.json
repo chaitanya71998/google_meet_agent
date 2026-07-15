@@ -1,0 +1,42 @@
+{
+  "name": "google-meet-agent",
+  "version": "0.2.0",
+  "description": "Autonomous agent that can join Google Meet, listen, and respond using LLM.",
+  "main": "dist/server.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx src/server.ts"
+  },
+  "keywords": [
+    "google",
+    "meet",
+    "agent",
+    "puppeteer",
+    "llm"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.2",
+    "keytar": "^7.9.0",
+    "node-cron": "^3.0.2",
+    "node-fetch": "^3.3.2",
+    "ollama": "^0.4.1",
+    "open": "^8.4.0",
+    "puppeteer": "^22.6.3",
+    "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.10.0",
+    "@types/node-cron": "^3.0.11",
+    "@types/ws": "^8.5.13",
+    "ts-node-dev": "^2.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.4.5"
+  }
+}
