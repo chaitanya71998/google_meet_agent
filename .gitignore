@@ -3,6 +3,10 @@ dist/
 .env
 .env.*
 !.env.example
+web/node_modules/
+web/.next/
+web/.env.local
+web/.env*.local
 
 # Local secrets / session data
 .google_meet_agent/
@@ -13,8 +17,8 @@ token.json
 
 # OS / editor
 .DS_Store
-.idea/
-.vscode/
+.idea
+.vscode
 *.log
 npm-debug.log*
 

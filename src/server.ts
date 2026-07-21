@@ -1,91 +1,315 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
 import { joinMeet } from './meet.js';
-import { startTranscription } from './audio.js';
+import { startTranscription, startTabAudioCapture } from './audio.js';
 import { getResponseFromLLM } from './llm.js';
+import { transcribeAudio } from './stt.js';
 import { speak } from './tts.js';
-import { setPage } from './pageHolder.js';
 import { scheduleAutoJoins } from './scheduler.js';
-import './config.js';
+import { sessionStore } from './sessions.js';
+import { SCHEDULES_FILE } from './config.js';
+import { verifyToken, extractBearer, AuthUser } from './auth.js';
+import { logger } from './logger.js';
+
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const PUBLIC_DIR = path.join(projectRoot, 'public');
 
 const app = express();
 app.use(express.json());
 
-// Global reference to the current Meet page (if any)
-let meetPage: any = null;
+// ---- Helpers ---------------------------------------------------------------
 
-// Health check
-app.get('/status', (_req: Request, res: Response) => {
+function isValidMeetUrl(url: unknown): url is string {
+  if (typeof url !== 'string') return false;
+  try {
+    const u = new URL(url);
+    return u.protocol === 'https:' && u.hostname.endsWith('meet.google.com');
+  } catch {
+    return false;
+  }
+}
+
+function body(req: Request): any {
+  return (req.body ?? {}) as any;
+}
+
+function pid(req: Request): string {
+  return String(req.params.id);
+}
+
+// Express 4 does not forward async rejections to error middleware automatically.
+function asyncHandler(fn: (req: Request, res: Response) => Promise<void>) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    fn(req, res).catch(next);
+  };
+}
+
+class HttpError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+/** Require a valid Supabase session; attach `req.user`. */
+async function requireAuth(req: Request, res: Response, next: NextFunction) {
+  const user: AuthUser | null = await verifyToken(extractBearer(req));
+  if (!user) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  (req as any).user = user;
+  next();
+}
+
+// ---- API -------------------------------------------------------------------
+
+app.get('/api/health', (_req: Request, res: Response) => {
   res.json({ status: 'running', uptime: process.uptime() });
 });
-/**
- * POST /join
- * Body: { url: string, mute?: boolean, video?: boolean }
- * Launches a Chromium instance, signs in, and joins the Meet.
- */
-app.post('/join', async (req: Request, res: Response) => {
-  const { url, mute = true, video = false, name } = req.body;
-  if (!url) {
-    return res.status(400).json({ error: 'Missing Meet URL' });
-  }
-  try {
-    const page = await joinMeet(url, { mute, video, name });
-    // Store the page for TTS later
-    setPage(page);
-    meetPage = page;
-    // Attach transcription stream to this page
-    await startTranscription(page);
-    res.json({ message: 'Joined Meet', pageId: (page.target() as any)._targetId });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: (e as Error).message });
-  }
-});
 
-/**
- * POST /transcript
- * Body: { text: string }
- * Called by the injected SpeechRecognition script inside the Meet tab.
- * Forwards the transcript to the LLM and speaks the reply.
- */
-app.post('/transcript', async (req: Request, res: Response) => {
-  const { text } = req.body;
-  if (!text) {
-    return res.status(400).json({ error: 'Missing transcript text' });
+// All routes below require auth.
+app.use('/api', requireAuth);
+
+app.get('/api/sessions', asyncHandler(async (req: Request, res: Response) => {
+  const sessions = await sessionStore.list((req as any).user.id);
+  res.json(
+    sessions.map((s: any) => ({
+      id: s.id,
+      url: s.url,
+      name: s.name,
+      mute: s.mute,
+      video: s.video,
+      status: s.status,
+      createdAt: s.created_at,
+      updatedAt: s.updated_at,
+      messageCount: undefined,
+    })),
+  );
+}));
+
+app.get('/api/sessions/:id', asyncHandler(async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  const session = await sessionStore.get(pid(req), userId);
+  if (!session) throw new HttpError(404, 'Session not found');
+  const messages = await sessionStore.getMessages(pid(req), userId);
+  res.json({
+    id: session.id,
+    url: session.url,
+    name: session.name,
+    mute: session.mute,
+    video: session.video,
+    status: session.status,
+    error: session.error,
+    createdAt: session.created_at,
+    updatedAt: session.updated_at,
+    messages: messages.map((m: any) => ({
+      id: m.id,
+      role: m.role,
+      text: m.text,
+      at: m.created_at,
+    })),
+  });
+}));
+
+app.post('/api/sessions', asyncHandler(async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  const { url, mute = true, video = false, name = 'Meet Agent' } = body(req);
+  if (!isValidMeetUrl(url)) throw new HttpError(400, 'A valid Google Meet URL is required');
+
+  const id = await sessionStore.create({
+    userId,
+    url,
+    name: String(name).slice(0, 60),
+    mute: Boolean(mute),
+    video: Boolean(video),
+  });
+
+  // Fire-and-forget join; status is persisted to Supabase.
+  (async () => {
+    try {
+      await sessionStore.update(id, userId, { status: 'joining' });
+      await sessionStore.addMessage({
+        sessionId: id,
+        userId,
+        role: 'agent',
+        text: '🔄 Launching browser and joining meeting…',
+      });
+      const page = await joinMeet(url, { mute, video, name }, id);
+      sessionStore.setPage(id, page);
+      await sessionStore.update(id, userId, { status: 'in-call' });
+      await sessionStore.addMessage({
+        sessionId: id,
+        userId,
+        role: 'agent',
+        text: '✅ Joined the meeting. Listening…',
+      });
+      await startTranscription(page, id);
+      try {
+        await startTabAudioCapture(page, id);
+      } catch (e) {
+        logger.warn('Tab audio capture unavailable', { sessionId: id, error: (e as Error).message });
+      }
+      await sessionStore.update(id, userId, { status: 'transcribing' });
+      logger.info('Joined Meet', { sessionId: id, url });
+    } catch (err) {
+      const msg = (err as Error).message;
+      await sessionStore.update(id, userId, { status: 'error', error: msg });
+      await sessionStore.addMessage({
+        sessionId: id,
+        userId,
+        role: 'agent',
+        text: `⚠️ Join failed: ${msg}`,
+      });
+      logger.error('Join failed', { sessionId: id, error: msg });
+    }
+  })();
+
+  res.status(201).json({ id, url, status: 'joining' });
+}));
+
+app.post('/api/sessions/:id/leave', asyncHandler(async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  const session = await sessionStore.get(pid(req), userId);
+  if (!session) throw new HttpError(404, 'Session not found');
+  const page = sessionStore.getPage(pid(req));
+  if (page) {
+    page.close().catch(() => undefined);
+    sessionStore.clearPage(pid(req));
   }
+  await sessionStore.update(pid(req), userId, { status: 'left' });
+  res.json({ id: pid(req), status: 'left' });
+}));
+
+app.delete('/api/sessions/:id', asyncHandler(async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  await sessionStore.delete(pid(req), userId);
+  res.status(204).end();
+}));
+
+app.post('/api/transcript', asyncHandler(async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  const { text, sessionId } = body(req);
+  if (!text || typeof text !== 'string') throw new HttpError(400, 'Missing transcript text');
+  if (!sessionId) throw new HttpError(400, 'Missing sessionId');
+
+  const session = await sessionStore.get(sessionId, userId);
+  if (!session) throw new HttpError(404, 'Session not found');
+
+  await sessionStore.addMessage({ sessionId, userId, role: 'user', text });
+  logger.info('Transcript received', { sessionId, userId, text: text.slice(0, 80) });
+
   try {
     const reply = await getResponseFromLLM(text);
-    await speak(reply);
+    await sessionStore.addMessage({ sessionId, userId, role: 'agent', text: reply });
+    await speak(reply, sessionId);
     res.json({ reply });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: (e as Error).message });
+    const msg = (e as Error).message;
+    await sessionStore.addMessage({ sessionId, userId, role: 'agent', text: `⚠️ ${msg}` });
+    logger.error('LLM/transcript handling failed', { sessionId, error: msg });
+    res.json({ reply: null, error: msg });
   }
-});
+}));
 
-/**
- * POST /message
- * Body: { text: string }
- * Allows external manual messages to be sent to the LLM.
- */
-app.post('/message', async (req: Request, res: Response) => {
-  const { text } = req.body;
-  if (!text) {
-    return res.status(400).json({ error: 'Missing text' });
+app.post('/api/transcript-event', asyncHandler(async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  const { kind, detail, sessionId } = body(req);
+  const benign = ['no-speech', 'aborted', 'audio-capture', 'tab-audio: Could not start video source', 'tab-audio: denied'];
+  if (kind === 'error' && detail && !benign.some((b) => detail.includes(b))) {
+    logger.warn('Transcript recognizer error', { sessionId, detail });
+    await sessionStore.addMessage({ sessionId, userId, role: 'agent', text: `⚠️ Speech recognition error: ${detail}` });
   }
+  res.json({ ok: true });
+}));
+
+app.post('/api/audio', asyncHandler(async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  const { data, mime, sessionId } = body(req);
+  if (!sessionId) { res.json({ ok: true }); return; }
+  const session = await sessionStore.get(sessionId, userId);
+  if (!session) { res.json({ ok: true }); return; }
+  if (!data || typeof data !== 'string') { res.json({ ok: true }); return; }
+  try {
+    const buf = Buffer.from(data, 'base64');
+    const text = await transcribeAudio(buf, typeof mime === 'string' ? mime : 'audio/webm');
+    if (!text) { res.json({ ok: true, transcribed: false }); return; }
+    await sessionStore.addMessage({ sessionId, userId, role: 'user', text });
+    logger.info('Tab audio transcribed', { sessionId, text: text.slice(0, 80) });
+    try {
+      const reply = await getResponseFromLLM(text);
+      await sessionStore.addMessage({ sessionId, userId, role: 'agent', text: reply });
+      await speak(reply, sessionId);
+      res.json({ ok: true, transcribed: true, reply });
+    } catch (e) {
+      const msg = (e as Error).message;
+      await sessionStore.addMessage({ sessionId, userId, role: 'agent', text: `⚠️ ${msg}` });
+      res.json({ ok: true, transcribed: true, error: msg });
+    }
+  } catch (e) {
+    logger.error('Audio processing failed', { sessionId, error: (e as Error).message });
+    res.json({ ok: true, transcribed: false });
+  }
+}));
+
+app.post('/api/sessions/:id/message', asyncHandler(async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  const { text } = body(req);
+  if (!text || typeof text !== 'string') throw new HttpError(400, 'Missing text');
+  const session = await sessionStore.get(pid(req), userId);
+  if (!session) throw new HttpError(404, 'Session not found');
+
+  await sessionStore.addMessage({ sessionId: pid(req), userId, role: 'user', text });
   try {
     const reply = await getResponseFromLLM(text);
-    await speak(reply);
+    await sessionStore.addMessage({ sessionId: pid(req), userId, role: 'agent', text: reply });
+    await speak(reply, pid(req));
     res.json({ reply });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: (e as Error).message });
+    const msg = (e as Error).message;
+    await sessionStore.addMessage({ sessionId: pid(req), userId, role: 'agent', text: `⚠️ ${msg}` });
+    logger.error('Message handling failed', { sessionId: pid(req), error: msg });
+    res.json({ reply: null, error: msg });
   }
+}));
+
+app.get('/api/schedules', asyncHandler(async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  try {
+    const raw = fs.readFileSync(SCHEDULES_FILE, 'utf-8');
+    res.json(JSON.parse(raw));
+  } catch {
+    res.json([]);
+  }
+}));
+
+// ---- Static UI (optional; Vercel serves the real frontend) ------------------
+
+if (fs.existsSync(PUBLIC_DIR) && fs.readdirSync(PUBLIC_DIR).length) {
+  app.use(express.static(PUBLIC_DIR));
+  app.get('*', (_req: Request, res: Response) => {
+    const indexFile = path.join(PUBLIC_DIR, 'index.html');
+    if (fs.existsSync(indexFile)) res.sendFile(indexFile);
+    else res.status(404).json({ error: 'UI not built' });
+  });
+}
+
+// ---- Error handling (must be registered last) -------------------------------
+
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  if (err instanceof HttpError) {
+    logger.warn('Request error', { status: err.status, message: err.message });
+    return res.status(err.status).json({ error: err.message });
+  }
+  logger.error('Unhandled error', { error: (err as Error).message });
+  res.status(500).json({ error: 'Internal server error' });
 });
 
-// Initialize scheduled auto‑joins (cron definitions are read from schedules.json)
+// ---- Startup ----------------------------------------------------------------
+
 scheduleAutoJoins();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Google‑Meet‑Agent server listening on port ${PORT}`);
+  logger.info(`Google-Meet-Agent server listening on port ${PORT}`);
 });

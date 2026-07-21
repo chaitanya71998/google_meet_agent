@@ -1,0 +1,28 @@
+services:
+  meet-agent:
+    build: .
+    container_name: google-meet-agent
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - OPENROUTER_MODEL=${OPENROUTER_MODEL:-openai/gpt-4o-mini}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_STT_MODEL=${OPENAI_STT_MODEL:-whisper-1}
+      - STT_LANGUAGE=${STT_LANGUAGE:-en}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - BACKEND_BASE_URL=${BACKEND_BASE_URL:-http://localhost:3000}
+      - SCHEDULER_USER_ID=${SCHEDULER_USER_ID}
+      - PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+    volumes:
+      # Persist Chrome profile + stored token across restarts
+      - meet-profile:/root/.google_meet_agent
+    restart: unless-stopped
+
+volumes:
+  meet-profile:

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Google Meet Agent</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">●</span>
+        <h1>Google Meet Agent</h1>
+      </div>
+      <div class="status-pill" id="server-status" data-state="unknown">
+        <span class="dot"></span><span class="label">Connecting…</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <h2>Sessions</h2>
+          <button id="refresh-btn" class="icon-btn" title="Refresh">⟳</button>
+        </div>
+        <button id="open-join-modal" class="primary-btn full">+ Join a Meeting</button>
+        <ul id="session-list" class="session-list">
+          <li class="empty">No active sessions</li>
+        </ul>
+      </aside>
+
+      <section class="content">
+        <div id="detail" class="detail empty-state">
+          <div class="empty-illustration">🎙️</div>
+          <h2>Select or start a meeting</h2>
+          <p>Join a Google Meet and let the agent listen, respond, and speak on your behalf.</p>
+        </div>
+      </section>
+    </main>
+
+    <div id="join-modal" class="modal hidden">
+      <div class="modal-card">
+        <div class="modal-head">
+          <h2>Join a Meeting</h2>
+          <button class="icon-btn" id="close-join-modal">✕</button>
+        </div>
+        <form id="join-form">
+          <label>
+            Google Meet URL
+            <input type="url" name="url" placeholder="https://meet.google.com/xxx-xxxx-xxx" required />
+          </label>
+          <label>
+            Display name
+            <input type="text" name="name" value="Meet Agent" maxlength="60" />
+          </label>
+          <div class="row">
+            <label class="checkbox">
+              <input type="checkbox" name="mute" checked /> Start muted
+            </label>
+            <label class="checkbox">
+              <input type="checkbox" name="video" /> Enable camera
+            </label>
+          </div>
+          <div id="join-error" class="form-error hidden"></div>
+          <div class="modal-actions">
+            <button type="button" class="ghost-btn" id="cancel-join">Cancel</button>
+            <button type="submit" class="primary-btn" id="join-submit">Join</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
