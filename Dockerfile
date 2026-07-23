@@ -39,9 +39,6 @@ COPY schedules.json ./schedules.json
 
 EXPOSE 3000
 
-# Persist the Chrome profile + token storage across restarts
-VOLUME ["/root/.google_meet_agent"]
-
 # Start a virtual display, then launch the agent server.
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
 RUN chmod +x ./docker-entrypoint.sh
