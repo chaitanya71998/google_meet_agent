@@ -16,6 +16,13 @@ import { initSentry, setupSentryErrorHandler } from './sentry.js';
 
 initSentry();
 
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception', { error: err.message, stack: err.stack });
+});
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled rejection', { error: String(reason) });
+});
+
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PUBLIC_DIR = path.join(projectRoot, 'public');
 
@@ -66,6 +73,10 @@ async function requireAuth(req: Request, res: Response, next: NextFunction) {
 }
 
 // ---- API -------------------------------------------------------------------
+
+app.get('/', (_req: Request, res: Response) => {
+  res.json({ service: 'google-meet-agent', status: 'running', uptime: process.uptime() });
+});
 
 app.get('/api/health', (_req: Request, res: Response) => {
   res.json({ status: 'running', uptime: process.uptime() });
@@ -327,8 +338,12 @@ scheduleAutoJoins();
 const isTest = process.env.NODE_ENV === 'test' || process.env.VITEST;
 if (!isTest) {
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     logger.info(`Google-Meet-Agent server listening on port ${PORT}`);
+  });
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    logger.error('Failed to start server', { error: err.message, code: err.code });
+    process.exit(1);
   });
 }
 
