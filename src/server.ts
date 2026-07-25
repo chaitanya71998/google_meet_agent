@@ -68,7 +68,81 @@ app.get('/api/health', (_req: Request, res: Response) => {
   res.json({ status: 'running', uptime: process.uptime() });
 });
 
-// All routes below require auth.
+// ---- Unauthenticated routes (called from in-page browser scripts) ------------
+// These are called by browser-injected SpeechRecognition / MediaRecorder scripts
+// that don't have access to the Supabase JWT. We verify the session exists and
+// use its owner as the user context.
+
+app.post('/api/transcript', asyncHandler(async (req: Request, res: Response) => {
+  const { text, sessionId } = body(req);
+  if (!text || typeof text !== 'string') throw new HttpError(400, 'Missing transcript text');
+  if (!sessionId) throw new HttpError(400, 'Missing sessionId');
+
+  const session = await sessionStore.getById(sessionId);
+  if (!session) throw new HttpError(404, 'Session not found');
+  const userId = session.user_id;
+
+  await sessionStore.addMessage({ sessionId, userId, role: 'user', text });
+  logger.info('Transcript received', { sessionId, userId, text: text.slice(0, 80) });
+
+  try {
+    const reply = await getResponseFromLLM(text);
+    await sessionStore.addMessage({ sessionId, userId, role: 'agent', text: reply });
+    await speak(reply, sessionId);
+    res.json({ reply });
+  } catch (e) {
+    const msg = (e as Error).message;
+    await sessionStore.addMessage({ sessionId, userId, role: 'agent', text: `⚠️ ${msg}` });
+    logger.error('LLM/transcript handling failed', { sessionId, error: msg });
+    res.json({ reply: null, error: msg });
+  }
+}));
+
+app.post('/api/transcript-event', asyncHandler(async (req: Request, res: Response) => {
+  const { kind, detail, sessionId } = body(req);
+  const benign = ['no-speech', 'aborted', 'audio-capture', 'tab-audio: Could not start video source', 'tab-audio: denied'];
+  if (kind === 'error' && detail && !benign.some((b) => detail.includes(b))) {
+    logger.warn('Transcript recognizer error', { sessionId, detail });
+    const session = sessionId ? await sessionStore.getById(sessionId) : null;
+    if (session) {
+      await sessionStore.addMessage({ sessionId, userId: session.user_id, role: 'agent', text: `⚠️ Speech recognition error: ${detail}` });
+    }
+  }
+  res.json({ ok: true });
+}));
+
+app.post('/api/audio', asyncHandler(async (req: Request, res: Response) => {
+  const { data, mime, sessionId } = body(req);
+  if (!sessionId) { res.json({ ok: true }); return; }
+  const session = await sessionStore.getById(sessionId);
+  if (!session) { res.json({ ok: true }); return; }
+  const userId = session.user_id;
+  if (!data || typeof data !== 'string') { res.json({ ok: true }); return; }
+  try {
+    const buf = Buffer.from(data, 'base64');
+    const text = await transcribeAudio(buf, typeof mime === 'string' ? mime : 'audio/webm');
+    if (!text) { res.json({ ok: true, transcribed: false }); return; }
+    await sessionStore.addMessage({ sessionId, userId, role: 'user', text });
+    logger.info('Tab audio transcribed', { sessionId, text: text.slice(0, 80) });
+    try {
+      const reply = await getResponseFromLLM(text);
+      await sessionStore.addMessage({ sessionId, userId, role: 'agent', text: reply });
+      await speak(reply, sessionId);
+      res.json({ ok: true, transcribed: true, reply });
+    } catch (e) {
+      const msg = (e as Error).message;
+      await sessionStore.addMessage({ sessionId, userId, role: 'agent', text: `⚠️ ${msg}` });
+      res.json({ ok: true, transcribed: true, error: msg });
+    }
+  } catch (e) {
+    logger.error('Audio processing failed', { sessionId, error: (e as Error).message });
+    res.json({ ok: true, transcribed: false });
+  }
+}));
+
+// ---- Authenticated routes ---------------------------------------------------
+// All routes below require a valid Supabase JWT.
+
 app.use('/api', requireAuth);
 
 app.get('/api/sessions', asyncHandler(async (req: Request, res: Response) => {
@@ -187,71 +261,6 @@ app.delete('/api/sessions/:id', asyncHandler(async (req: Request, res: Response)
   res.status(204).end();
 }));
 
-app.post('/api/transcript', asyncHandler(async (req: Request, res: Response) => {
-  const userId = (req as any).user.id;
-  const { text, sessionId } = body(req);
-  if (!text || typeof text !== 'string') throw new HttpError(400, 'Missing transcript text');
-  if (!sessionId) throw new HttpError(400, 'Missing sessionId');
-
-  const session = await sessionStore.get(sessionId, userId);
-  if (!session) throw new HttpError(404, 'Session not found');
-
-  await sessionStore.addMessage({ sessionId, userId, role: 'user', text });
-  logger.info('Transcript received', { sessionId, userId, text: text.slice(0, 80) });
-
-  try {
-    const reply = await getResponseFromLLM(text);
-    await sessionStore.addMessage({ sessionId, userId, role: 'agent', text: reply });
-    await speak(reply, sessionId);
-    res.json({ reply });
-  } catch (e) {
-    const msg = (e as Error).message;
-    await sessionStore.addMessage({ sessionId, userId, role: 'agent', text: `⚠️ ${msg}` });
-    logger.error('LLM/transcript handling failed', { sessionId, error: msg });
-    res.json({ reply: null, error: msg });
-  }
-}));
-
-app.post('/api/transcript-event', asyncHandler(async (req: Request, res: Response) => {
-  const userId = (req as any).user.id;
-  const { kind, detail, sessionId } = body(req);
-  const benign = ['no-speech', 'aborted', 'audio-capture', 'tab-audio: Could not start video source', 'tab-audio: denied'];
-  if (kind === 'error' && detail && !benign.some((b) => detail.includes(b))) {
-    logger.warn('Transcript recognizer error', { sessionId, detail });
-    await sessionStore.addMessage({ sessionId, userId, role: 'agent', text: `⚠️ Speech recognition error: ${detail}` });
-  }
-  res.json({ ok: true });
-}));
-
-app.post('/api/audio', asyncHandler(async (req: Request, res: Response) => {
-  const userId = (req as any).user.id;
-  const { data, mime, sessionId } = body(req);
-  if (!sessionId) { res.json({ ok: true }); return; }
-  const session = await sessionStore.get(sessionId, userId);
-  if (!session) { res.json({ ok: true }); return; }
-  if (!data || typeof data !== 'string') { res.json({ ok: true }); return; }
-  try {
-    const buf = Buffer.from(data, 'base64');
-    const text = await transcribeAudio(buf, typeof mime === 'string' ? mime : 'audio/webm');
-    if (!text) { res.json({ ok: true, transcribed: false }); return; }
-    await sessionStore.addMessage({ sessionId, userId, role: 'user', text });
-    logger.info('Tab audio transcribed', { sessionId, text: text.slice(0, 80) });
-    try {
-      const reply = await getResponseFromLLM(text);
-      await sessionStore.addMessage({ sessionId, userId, role: 'agent', text: reply });
-      await speak(reply, sessionId);
-      res.json({ ok: true, transcribed: true, reply });
-    } catch (e) {
-      const msg = (e as Error).message;
-      await sessionStore.addMessage({ sessionId, userId, role: 'agent', text: `⚠️ ${msg}` });
-      res.json({ ok: true, transcribed: true, error: msg });
-    }
-  } catch (e) {
-    logger.error('Audio processing failed', { sessionId, error: (e as Error).message });
-    res.json({ ok: true, transcribed: false });
-  }
-}));
-
 app.post('/api/sessions/:id/message', asyncHandler(async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const { text } = body(req);
@@ -309,7 +318,13 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 scheduleAutoJoins();
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  logger.info(`Google-Meet-Agent server listening on port ${PORT}`);
-});
+// Only start listening when run directly (not when imported by tests).
+const isTest = process.env.NODE_ENV === 'test' || process.env.VITEST;
+if (!isTest) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    logger.info(`Google-Meet-Agent server listening on port ${PORT}`);
+  });
+}
+
+export { app };

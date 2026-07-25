@@ -72,6 +72,16 @@ class SessionStore {
     return data;
   }
 
+  async getById(id: string) {
+    const { data, error } = await this.sb()
+      .from('sessions')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    return data;
+  }
+
   async list(userId: string) {
     const { data, error } = await this.sb()
       .from('sessions')
