@@ -1,8 +1,15 @@
-# ---- Base image with Chromium for the Puppeteer agent ----
+# ---- Build stage: compile TypeScript ----
+FROM node:22-bookworm-slim AS builder
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY src ./src
+COPY tsconfig.json ./
+RUN npx tsc
+
+# ---- Runtime stage ----
 FROM node:22-bookworm-slim
 
-# Chromium + deps required to launch a (headful) Chrome, plus Xvfb so it runs
-# on a headless server without a physical display.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     xvfb \
@@ -34,12 +41,11 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-COPY dist ./dist
+COPY --from=builder /app/dist ./dist
 COPY schedules.json ./schedules.json
 
 EXPOSE 3000
 
-# Start a virtual display, then launch the agent server.
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
 RUN chmod +x ./docker-entrypoint.sh
 ENTRYPOINT ["./docker-entrypoint.sh"]
