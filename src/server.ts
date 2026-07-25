@@ -12,6 +12,9 @@ import { sessionStore } from './sessions.js';
 import { SCHEDULES_FILE } from './config.js';
 import { verifyToken, extractBearer, AuthUser } from './auth.js';
 import { logger } from './logger.js';
+import { initSentry, setupSentryErrorHandler } from './sentry.js';
+
+initSentry();
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PUBLIC_DIR = path.join(projectRoot, 'public');
@@ -304,6 +307,8 @@ if (fs.existsSync(PUBLIC_DIR) && fs.readdirSync(PUBLIC_DIR).length) {
 }
 
 // ---- Error handling (must be registered last) -------------------------------
+
+setupSentryErrorHandler(app);
 
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   if (err instanceof HttpError) {

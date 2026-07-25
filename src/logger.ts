@@ -1,9 +1,3 @@
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 interface LogEntry {
@@ -40,6 +34,11 @@ class Logger {
       process.stderr.write(line + '\n');
     } else {
       process.stdout.write(line + '\n');
+    }
+    if (process.env.SENTRY_DSN) {
+      try {
+        import('./sentry.js').then(({ captureLog }) => captureLog(level, msg, meta));
+      } catch { }
     }
   }
 
